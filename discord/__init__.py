@@ -43,18 +43,20 @@ from .template import *
 from .widget import *
 from .object import *
 from .reaction import *
-from . import utils, opus, abc
+from . import utils, opus, abc, rtp
 from .enums import *
 from .embeds import *
 from .mentions import *
 from .shard import *
 from .player import *
+from .reader import *
 from .webhook import *
 from .voice_client import *
 from .audit_logs import *
 from .raw_models import *
 from .team import *
 from .sticker import *
+from .speakingstate import *
 from .interactions import *
 
 VersionInfo = namedtuple('VersionInfo', 'major minor micro releaselevel serial')
