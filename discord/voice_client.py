@@ -325,6 +325,9 @@ class VoiceClient(VoiceProtocol):
         return ws
 
     async def connect(self, *, reconnect, timeout):
+        if not self._state._intents.voice_states:
+            raise ClientException('Intents.voice_states must be enabled to connect using VoiceClient.')
+
         log.info('Connecting to voice...')
         self.timeout = timeout
 

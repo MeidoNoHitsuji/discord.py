@@ -568,6 +568,9 @@ class Intents(BaseFlags):
         - :attr:`VoiceChannel.members`
         - :attr:`VoiceChannel.voice_states`
         - :attr:`Member.voice`
+
+        Due to its dependence on voice state, the default :class:`VoiceClient` implementation for :meth:`VoiceChannel.connect` also requires this intent.
+        Other implementations of :class:`VoiceProtocol` may be able to get around this.
         """
         return 1 << 7
 
