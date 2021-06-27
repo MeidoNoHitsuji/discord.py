@@ -32,13 +32,17 @@ from typing import (
     AsyncIterator,
     Callable,
     Dict,
+    ForwardRef,
     Generic,
     Iterable,
     Iterator,
     List,
+    Literal,
+    Mapping,
     Optional,
     Protocol,
     Sequence,
+    Tuple,
     Type,
     TypeVar,
     Union,
@@ -54,6 +58,8 @@ from inspect import isawaitable as _isawaitable, signature as _signature
 from operator import attrgetter
 import json
 import re
+import sys
+import types
 import warnings
 
 from .errors import InvalidArgument
@@ -73,6 +79,20 @@ __all__ = (
 )
 
 DISCORD_EPOCH = 1420070400000
+
+
+class _MissingSentinel:
+    def __eq__(self, other):
+        return False
+
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return '...'
+
+
+MISSING: Any = _MissingSentinel()
 
 
 class _cached_property:
@@ -98,7 +118,8 @@ if TYPE_CHECKING:
     from .template import Template
 
     class _RequestLike(Protocol):
-        headers: Dict[str, Any]
+        headers: Mapping[str, Any]
+
 
 else:
     cached_property = _cached_property
@@ -107,7 +128,6 @@ else:
 T = TypeVar('T')
 T_co = TypeVar('T_co', covariant=True)
 _Iter = Union[Iterator[T], AsyncIterator[T]]
-CSP = TypeVar('CSP', bound='CachedSlotProperty')
 
 
 class CachedSlotProperty(Generic[T, T_co]):
@@ -117,7 +137,7 @@ class CachedSlotProperty(Generic[T, T_co]):
         self.__doc__ = getattr(function, '__doc__')
 
     @overload
-    def __get__(self: CSP, instance: None, owner: Type[T]) -> CSP:
+    def __get__(self, instance: None, owner: Type[T]) -> CachedSlotProperty[T, T_co]:
         ...
 
     @overload
@@ -134,6 +154,17 @@ class CachedSlotProperty(Generic[T, T_co]):
             value = self.function(instance)
             setattr(instance, self.name, value)
             return value
+
+
+class classproperty(Generic[T_co]):
+    def __init__(self, fget: Callable[[Any], T_co]) -> None:
+        self.fget = fget
+
+    def __get__(self, instance: Optional[Any], owner: Type[Any]) -> T_co:
+        return self.fget(owner)
+
+    def __set__(self, instance, value) -> None:
+        raise AttributeError('cannot set attribute')
 
 
 def cached_slot_property(name: str) -> Callable[[Callable[[T], T_co]], CachedSlotProperty[T, T_co]]:
@@ -322,7 +353,7 @@ def find(predicate: Callable[[T], Any], seq: Iterable[T]) -> Optional[T]:
     -----------
     predicate
         A function that returns a boolean-like result.
-    seq: iterable
+    seq: :class:`collections.abc.Iterable`
         The iterable to search through.
     """
 
@@ -472,6 +503,21 @@ async def sane_wait_for(futures, *, timeout):
     return done
 
 
+def get_slots(cls: Type[Any]) -> Iterator[str]:
+    for mro in reversed(cls.__mro__):
+        try:
+            yield from mro.__slots__
+        except AttributeError:
+            continue
+
+
+def compute_timedelta(dt: datetime.datetime):
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return max((dt - now).total_seconds(), 0)
+
+
 async def sleep_until(when: datetime.datetime, result: Optional[T] = None) -> Optional[T]:
     """|coro|
 
@@ -489,17 +535,14 @@ async def sleep_until(when: datetime.datetime, result: Optional[T] = None) -> Op
     result: Any
         If provided is returned to the caller when the coroutine completes.
     """
-    if when.tzinfo is None:
-        when = when.astimezone()
-    now = datetime.datetime.now(datetime.timezone.utc)
-    delta = (when - now).total_seconds()
-    return await asyncio.sleep(max(delta, 0), result)
+    delta = compute_timedelta(when)
+    return await asyncio.sleep(delta, result)
 
 
 def utcnow() -> datetime.datetime:
     """A helper function to return an aware UTC datetime representing the current time.
 
-    This should be preferred to :func:`datetime.datetime.utcnow` since it is an aware
+    This should be preferred to :meth:`datetime.datetime.utcnow` since it is an aware
     datetime, compared to the naive datetime in the standard library.
 
     .. versionadded:: 2.0
@@ -531,7 +574,12 @@ class SnowflakeList(array.array):
 
     __slots__ = ()
 
-    def __new__(cls, data: Sequence[int], *, is_sorted: bool = False):
+    if TYPE_CHECKING:
+
+        def __init__(self, data: Iterable[int], *, is_sorted: bool = False):
+            ...
+
+    def __new__(cls, data: Iterable[int], *, is_sorted: bool = False):
         return array.array.__new__(cls, 'Q', data if is_sorted else sorted(data))  # type: ignore
 
     def add(self, element: int) -> None:
@@ -742,6 +790,7 @@ def _chunk(iterator: Iterator[T], max_size: int) -> Iterator[List[T]]:
     if ret:
         yield ret
 
+
 async def _achunk(iterator: AsyncIterator[T], max_size: int) -> AsyncIterator[List[T]]:
     ret = []
     n = 0
@@ -768,9 +817,9 @@ def as_chunks(iterator: AsyncIterator[T], max_size: int) -> AsyncIterator[List[T
 
 def as_chunks(iterator: _Iter[T], max_size: int) -> _Iter[List[T]]:
     """A helper function that collects an iterator into chunks of a given size.
-    
+
     .. versionadded:: 2.0
-    
+
     Parameters
     ----------
     iterator: Union[:class:`collections.abc.Iterator`, :class:`collections.abc.AsyncIterator`]
@@ -881,3 +930,96 @@ class Defaultdict(defaultdict):
 
         self[key] = value = self.default_factory(key)
         return value
+
+PY_310 = sys.version_info >= (3, 10)
+
+
+def flatten_literal_params(parameters: Iterable[Any]) -> Tuple[Any, ...]:
+    params = []
+    literal_cls = type(Literal[0])
+    for p in parameters:
+        if isinstance(p, literal_cls):
+            params.extend(p.__args__)
+        else:
+            params.append(p)
+    return tuple(params)
+
+
+def normalise_optional_params(parameters: Iterable[Any]) -> Tuple[Any, ...]:
+    none_cls = type(None)
+    return tuple(p for p in parameters if p is not none_cls) + (none_cls,)
+
+
+def evaluate_annotation(
+    tp: Any,
+    globals: Dict[str, Any],
+    locals: Dict[str, Any],
+    cache: Dict[str, Any],
+    *,
+    implicit_str: bool = True,
+):
+    if isinstance(tp, ForwardRef):
+        tp = tp.__forward_arg__
+        # ForwardRefs always evaluate their internals
+        implicit_str = True
+
+    if implicit_str and isinstance(tp, str):
+        if tp in cache:
+            return cache[tp]
+        evaluated = eval(tp, globals, locals)
+        cache[tp] = evaluated
+        return evaluate_annotation(evaluated, globals, locals, cache)
+
+    if hasattr(tp, '__args__'):
+        implicit_str = True
+        is_literal = False
+        args = tp.__args__
+        if not hasattr(tp, '__origin__'):
+            if PY_310 and tp.__class__ is types.Union:
+                converted = Union[args]  # type: ignore
+                return evaluate_annotation(converted, globals, locals, cache)
+
+            return tp
+        if tp.__origin__ is Union:
+            try:
+                if args.index(type(None)) != len(args) - 1:
+                    args = normalise_optional_params(tp.__args__)
+            except ValueError:
+                pass
+        if tp.__origin__ is Literal:
+            if not PY_310:
+                args = flatten_literal_params(tp.__args__)
+            implicit_str = False
+            is_literal = True
+
+        evaluated_args = tuple(evaluate_annotation(arg, globals, locals, cache, implicit_str=implicit_str) for arg in args)
+
+        if is_literal and not all(isinstance(x, (str, int, bool, type(None))) for x in evaluated_args):
+            raise TypeError('Literal arguments must be of type str, int, bool, or NoneType.')
+
+        if evaluated_args == args:
+            return tp
+
+        try:
+            return tp.copy_with(evaluated_args)
+        except AttributeError:
+            return tp.__origin__[evaluated_args]
+
+    return tp
+
+
+def resolve_annotation(
+    annotation: Any,
+    globalns: Dict[str, Any],
+    localns: Optional[Dict[str, Any]],
+    cache: Optional[Dict[str, Any]],
+) -> Any:
+    if annotation is None:
+        return type(None)
+    if isinstance(annotation, str):
+        annotation = ForwardRef(annotation)
+
+    locals = globalns if localns is None else localns
+    if cache is None:
+        cache = {}
+    return evaluate_annotation(annotation, globalns, locals, cache)

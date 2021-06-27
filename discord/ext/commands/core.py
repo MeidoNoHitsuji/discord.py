@@ -24,12 +24,9 @@ DEALINGS IN THE SOFTWARE.
 
 from typing import (
     Any,
+    Callable,
     Dict,
-    ForwardRef,
-    Iterable,
     Literal,
-    Optional,
-    Tuple,
     Union,
 )
 import asyncio
@@ -37,7 +34,6 @@ import functools
 import inspect
 import datetime
 import types
-import sys
 
 import discord
 
@@ -74,102 +70,22 @@ __all__ = (
     'bot_has_guild_permissions'
 )
 
-PY_310 = sys.version_info >= (3, 10)
-
-def flatten_literal_params(parameters: Iterable[Any]) -> Tuple[Any, ...]:
-    params = []
-    literal_cls = type(Literal[0])
-    for p in parameters:
-        if isinstance(p, literal_cls):
-            params.extend(p.__args__)
+def unwrap_function(function: Callable[..., Any]) -> Callable[..., Any]:
+    partial = functools.partial
+    while True:
+        if hasattr(function, '__wrapped__'):
+            function = function.__wrapped__
+        elif isinstance(function, partial):
+            function = function.func
         else:
-            params.append(p)
-    return tuple(params)
+            return function
 
-def normalise_optional_params(parameters: Iterable[Any]) -> Tuple[Any, ...]:
-    none_cls = type(None)
-    return tuple(p for p in parameters if p is not none_cls) + (none_cls,)
 
-def _evaluate_annotation(
-    tp: Any,
-    globals: Dict[str, Any],
-    locals: Dict[str, Any],
-    cache: Dict[str, Any],
-    *,
-    implicit_str: bool = True,
-):
-    if isinstance(tp, ForwardRef):
-        tp = tp.__forward_arg__
-        # ForwardRefs always evaluate their internals
-        implicit_str = True
-
-    if implicit_str and isinstance(tp, str):
-        if tp in cache:
-            return cache[tp]
-        evaluated = eval(tp, globals, locals)
-        cache[tp] = evaluated
-        return _evaluate_annotation(evaluated, globals, locals, cache)
-
-    if hasattr(tp, '__args__'):
-        implicit_str = True
-        is_literal = False
-        args = tp.__args__
-        if not hasattr(tp, '__origin__'):
-            if PY_310 and tp.__class__ is types.Union:
-                converted = Union[args]  # type: ignore
-                return _evaluate_annotation(converted, globals, locals, cache)
-
-            return tp
-        if tp.__origin__ is Union:
-            try:
-                if args.index(type(None)) != len(args) - 1:
-                    args = normalise_optional_params(tp.__args__)
-            except ValueError:
-                pass
-        if tp.__origin__ is Literal:
-            if not PY_310:
-                args = flatten_literal_params(tp.__args__)
-            implicit_str = False
-            is_literal = True
-
-        evaluated_args = tuple(
-            _evaluate_annotation(arg, globals, locals, cache, implicit_str=implicit_str) for arg in args
-        )
-
-        if is_literal and not all(isinstance(x, (str, int, bool, float, complex)) for x in evaluated_args):
-            raise TypeError('Literal arguments must be of type str, int, bool, float or complex.')
-
-        if evaluated_args == args:
-            return tp
-
-        try:
-            return tp.copy_with(evaluated_args)
-        except AttributeError:
-            return tp.__origin__[evaluated_args]
-
-    return tp
-
-def resolve_annotation(
-    annotation: Any,
-    globalns: Dict[str, Any],
-    localns: Optional[Dict[str, Any]],
-    cache: Optional[Dict[str, Any]],
-) -> Any:
-    if annotation is None:
-        return type(None)
-    if isinstance(annotation, str):
-        annotation = ForwardRef(annotation)
-
-    locals = globalns if localns is None else localns
-    if cache is None:
-        cache = {}
-    return _evaluate_annotation(annotation, globalns, locals, cache)
-
-def get_signature_parameters(function: types.FunctionType) -> Dict[str, inspect.Parameter]:
-    globalns = function.__globals__
+def get_signature_parameters(function: Callable[..., Any], globalns: Dict[str, Any]) -> Dict[str, inspect.Parameter]:
     signature = inspect.signature(function)
     params = {}
     cache: Dict[str, Any] = {}
+    eval_annotation = discord.utils.evaluate_annotation
     for name, parameter in signature.parameters.items():
         annotation = parameter.annotation
         if annotation is parameter.empty:
@@ -179,7 +95,7 @@ def get_signature_parameters(function: types.FunctionType) -> Dict[str, inspect.
             params[name] = parameter.replace(annotation=type(None))
             continue
 
-        annotation = _evaluate_annotation(annotation, globalns, globalns, cache)
+        annotation = eval_annotation(annotation, globalns, globalns, cache)
         if annotation is Greedy:
             raise TypeError('Unparameterized Greedy[...] is disallowed in signature.')
 
@@ -269,8 +185,8 @@ class Command(_BaseCommand):
         If the command is invoked while it is disabled, then
         :exc:`.DisabledCommand` is raised to the :func:`.on_command_error`
         event. Defaults to ``True``.
-    parent: Optional[:class:`Command`]
-        The parent command that this command belongs to. ``None`` if there
+    parent: Optional[:class:`Group`]
+        The parent group that this command belongs to. ``None`` if there
         isn't one.
     cog: Optional[:class:`Cog`]
         The cog that this command belongs to. ``None`` if there isn't one.
@@ -310,6 +226,14 @@ class Command(_BaseCommand):
         If ``True``\, cooldown processing is done after argument parsing,
         which calls converters. If ``False`` then cooldown processing is done
         first and then the converters are called second. Defaults to ``False``.
+    extras: :class:`dict`
+        A dict of user provided extras to attach to the Command. 
+        
+        .. note::
+            This object may be copied by the library.
+
+
+        .. versionadded:: 2.0
     """
 
     def __new__(cls, *args, **kwargs):
@@ -353,6 +277,7 @@ class Command(_BaseCommand):
         self.usage = kwargs.get('usage')
         self.rest_is_raw = kwargs.get('rest_is_raw', False)
         self.aliases = kwargs.get('aliases', [])
+        self.extras = kwargs.get('extras', {})
 
         if not isinstance(self.aliases, (list, tuple)):
             raise TypeError("Aliases of a command must be a list or a tuple of strings.")
@@ -415,8 +340,15 @@ class Command(_BaseCommand):
     @callback.setter
     def callback(self, function):
         self._callback = function
-        self.module = function.__module__
-        self.params = get_signature_parameters(function)
+        unwrap = unwrap_function(function)
+        self.module = unwrap.__module__
+
+        try:
+            globalns = unwrap.__globals__
+        except AttributeError:
+            globalns = {}
+
+        self.params = get_signature_parameters(function, globalns)
 
     def add_check(self, func):
         """Adds a check to the command.
@@ -651,7 +583,7 @@ class Command(_BaseCommand):
 
     @property
     def parents(self):
-        """List[:class:`Command`]: Retrieves the parents of this command.
+        """List[:class:`Group`]: Retrieves the parents of this command.
 
         If the command has no parents then it returns an empty :class:`list`.
 
@@ -669,7 +601,7 @@ class Command(_BaseCommand):
 
     @property
     def root_parent(self):
-        """Optional[:class:`Command`]: Retrieves the root parent of this command.
+        """Optional[:class:`Group`]: Retrieves the root parent of this command.
 
         If the command has no parents then it returns ``None``.
 
@@ -1003,9 +935,9 @@ class Command(_BaseCommand):
     def short_doc(self):
         """:class:`str`: Gets the "short" documentation of a command.
 
-        By default, this is the :attr:`brief` attribute.
+        By default, this is the :attr:`.brief` attribute.
         If that lookup leads to an empty string then the first line of the
-        :attr:`help` attribute is used instead.
+        :attr:`.help` attribute is used instead.
         """
         if self.brief is not None:
             return self.brief
@@ -1074,7 +1006,7 @@ class Command(_BaseCommand):
         """|coro|
 
         Checks if the command can be executed by checking all the predicates
-        inside the :attr:`checks` attribute. This also checks whether the
+        inside the :attr:`~Command.checks` attribute. This also checks whether the
         command is disabled.
 
         .. versionchanged:: 1.3

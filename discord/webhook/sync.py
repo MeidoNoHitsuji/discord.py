@@ -45,7 +45,7 @@ from ..message import Message
 from ..http import Route
 from ..object import Object
 
-from .async_ import BaseWebhook, handle_message_parameters, _WebhookState, MISSING
+from .async_ import BaseWebhook, handle_message_parameters, _WebhookState
 
 __all__ = (
     'SyncWebhook',
@@ -67,6 +67,8 @@ if TYPE_CHECKING:
         from requests import Session, Response
     except ModuleNotFoundError:
         pass
+
+MISSING = utils.MISSING
 
 
 class DeferredLock:
@@ -125,6 +127,7 @@ class WebhookAdapter:
 
         response: Optional[Response] = None
         data: Optional[Union[Dict[str, Any], str]] = None
+        file_data: Optional[Dict[str, Any]] = None
         method = route.method
         url = route.url
         webhook_id = route.webhook_id
@@ -135,13 +138,16 @@ class WebhookAdapter:
                     file.reset(seek=attempt)
 
                 if multipart:
-                    form_data: Dict[str, Any] = {}
+                    file_data = {}
                     for p in multipart:
-                        form_data[p['name']] = (p['filename'], p['value'], p['content_type'])
-                    to_send = form_data
+                        name = p['name']
+                        if name == 'payload_json':
+                            to_send = { 'payload_json': p['value'] }
+                        else:
+                            file_data[name] = (p['filename'], p['value'], p['content_type'])
 
                 try:
-                    with session.request(method, url, data=to_send, headers=headers, params=params) as response:
+                    with session.request(method, url, data=to_send, files=file_data, headers=headers, params=params) as response:
                         log.debug(
                             'Webhook ID %s with %s %s has returned status code %s',
                             webhook_id,
@@ -150,6 +156,9 @@ class WebhookAdapter:
                             response.status_code,
                         )
                         response.encoding = 'utf-8'
+                        # Compatibility with aiohttp
+                        response.status = response.status_code  # type: ignore
+
                         data = response.text or None
                         if data and response.headers['Content-Type'] == 'application/json':
                             data = json.loads(data)
@@ -253,9 +262,12 @@ class WebhookAdapter:
         payload: Optional[Dict[str, Any]] = None,
         multipart: Optional[List[Dict[str, Any]]] = None,
         files: Optional[List[File]] = None,
+        thread_id: Optional[int] = None,
         wait: bool = False,
     ):
         params = {'wait': int(wait)}
+        if thread_id:
+            params['thread_id'] = thread_id
         route = Route('POST', '/webhooks/{webhook_id}/{webhook_token}', webhook_id=webhook_id, webhook_token=token)
         return self.request(route, session, payload=payload, multipart=multipart, files=files, params=params)
 
@@ -332,6 +344,7 @@ class WebhookAdapter:
     ):
         route = Route('GET', '/webhooks/{webhook_id}/{webhook_token}', webhook_id=webhook_id, webhook_token=token)
         return self.request(route, session=session)
+
 
 _context = threading.local()
 _context.adapter = WebhookAdapter()
@@ -468,8 +481,6 @@ class SyncWebhook(BaseWebhook):
         received without authentication then this will be ``None``.
     name: Optional[:class:`str`]
         The default name of the webhook.
-    avatar: Optional[:class:`str`]
-        The default avatar of the webhook.
     source_guild: Optional[:class:`PartialWebhookGuild`]
         The guild of the channel that this webhook is following.
         Only given if :attr:`type` is :attr:`WebhookType.channel_follower`.
@@ -772,6 +783,7 @@ class SyncWebhook(BaseWebhook):
         embed: Embed = MISSING,
         embeds: List[Embed] = MISSING,
         allowed_mentions: AllowedMentions = MISSING,
+        thread: Snowflake = MISSING,
         wait: bool = False,
     ) -> Optional[SyncWebhookMessage]:
         """Sends a message using the webhook.
@@ -816,6 +828,10 @@ class SyncWebhook(BaseWebhook):
             Controls the mentions being processed in this message.
 
             .. versionadded:: 1.4
+        thread: :class:`~discord.abc.Snowflake`
+            The thread to send this message to.
+
+            .. versionadded:: 2.0
 
         Raises
         --------
@@ -835,7 +851,7 @@ class SyncWebhook(BaseWebhook):
         Returns
         ---------
         Optional[:class:`SyncWebhookMessage`]
-            The message that was sent.
+            If ``wait`` is ``True`` then the message that was sent, otherwise ``None``.
         """
 
         if self.token is None:
@@ -843,7 +859,7 @@ class SyncWebhook(BaseWebhook):
 
         previous_mentions: Optional[AllowedMentions] = getattr(self._state, 'allowed_mentions', None)
         if content is None:
-            content = ...  # type: ignore
+            content = MISSING
 
         params = handle_message_parameters(
             content=content,
@@ -858,6 +874,10 @@ class SyncWebhook(BaseWebhook):
             previous_allowed_mentions=previous_mentions,
         )
         adapter: WebhookAdapter = _context.adapter
+        thread_id: Optional[int] = None
+        if thread is not MISSING:
+            thread_id = thread.id
+
         data = adapter.execute_webhook(
             self.id,
             self.token,
@@ -865,6 +885,7 @@ class SyncWebhook(BaseWebhook):
             payload=params.payload,
             multipart=params.multipart,
             files=params.files,
+            thread_id=thread_id,
             wait=wait,
         )
         if wait:
